@@ -771,6 +771,25 @@ export default function ConveyorDashboard() {
               Export
             </div>
           </button>
+
+          <button
+            style={styles.historyCard}
+            onClick={() => window.open("/ironguard.html", "_blank")}
+          >
+            <div style={styles.historyIcon}>
+              <PlayCircle size={18} color="#6c5ce7" />
+            </div>
+            <div style={{ flex: 1, textAlign: "left" }}>
+              <div style={styles.historyTitle}>Run 3D Simulation</div>
+              <div style={styles.historySub}>
+                Interactive 3D digital twin visualizing sensors and automated detection pipeline.
+              </div>
+            </div>
+            <div style={styles.historyDownload}>
+              <PlayCircle size={15} />
+              Launch
+            </div>
+          </button>
         </div>
 
         <div style={styles.rightPanel}>
@@ -924,6 +943,13 @@ export default function ConveyorDashboard() {
   );
 }
 
+function SimulationPanel() {
+  return (
+    <div style={{ width: "100%", height: "70vh", minHeight: 600, position: "relative" }}>
+      <iframe src="/simulation.html" style={{ width: "100%", height: "100%", border: "none", borderRadius: 12, background: "#000" }} title="3D Digital Twin Simulation" />
+    </div>
+  );
+}
 
 function ReportsPanel() {
   const [selectedDate, setSelectedDate] = useState(DEMO_HISTORY[0].date);
