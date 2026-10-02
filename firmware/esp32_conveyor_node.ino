@@ -1,178 +1,239 @@
-/*
-  Smart Conveyor Guard — ESP32 Joint Node
-  --------------------------------------------------------------
-  Sensors actually wired up on this build:
-    - MPU6050              : vibration (accelerometer, RMS in g)
-    - HX711 + strain gauge  : belt tension (kN)
-    - IR proximity sensor   : belt speed (pulses -> m/s)
-
-  No temperature sensor on this build. temperature_c is simply left out
-  of the JSON payload -- the backend already treats it as optional and
-  will show "unknown" rather than a fake number. If you add an MLX90614
-  later, see the commented-out block near the bottom of loop().
-
-  Publishes one JSON reading per second to:
-    conveyor/<JOINT_ID>/telemetry
-
-  ---------------- WIRING ----------------
-  MPU6050 (I2C):
-    VCC -> 3.3V        GND -> GND
-    SCL -> GPIO 22      SDA -> GPIO 21   (ESP32 default I2C pins)
-
-  HX711 (load cell amp):
-    VCC -> 3.3V or 5V   GND -> GND
-    DT  -> GPIO 16      SCK -> GPIO 4
-
-  IR proximity sensor (digital output, e.g. E18-D80NK or similar):
-    VCC -> 5V (check your module's rating)   GND -> GND
-    OUT -> GPIO 27  (through the module's own digital output, no extra
-                     resistor needed if module has a built-in comparator)
-
-  ---------------- LIBRARIES (Arduino IDE Library Manager) ----------------
-    - PubSubClient          by Nick O'Leary        (MQTT)
-    - Adafruit MPU6050      by Adafruit
-    - Adafruit Unified Sensor  by Adafruit          (MPU6050 dependency)
-    - HX711                 by bogde
-  WiFi.h and Wire.h are built into the ESP32 board package, nothing to
-  install for those.
-*/
-
 #include <WiFi.h>
-#include <PubSubClient.h>
+#include <WebServer.h>
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <HX711.h>
+#include <Adafruit_MLX90614.h>
+#include "HX711.h"
+#include <ArduinoJson.h>
 
-// ---------------- CONFIG -- edit these before uploading ----------------
-#define JOINT_ID        "J1"                  // change per board: J1, J2, J3 ...
-const char* WIFI_SSID   = "YOUR_WIFI_SSID";
-const char* WIFI_PASS   = "YOUR_WIFI_PASSWORD";
-const char* MQTT_HOST   = "192.168.11.127";      // your laptop's IP (see README)
-const int   MQTT_PORT   = 1883;
-const unsigned long SAMPLE_INTERVAL_MS = 1000; // 1 reading/sec
+// ===========================
+// PIN DEFINITIONS (STANDARD ESP32)
+// ===========================
+#define I2C_SDA_PIN       21
+#define I2C_SCL_PIN       22
+#define HX711_DT_PIN      18
+#define HX711_SCK_PIN     19
+#define IR_SENSOR_PIN      4
+#define MOTOR_PWM_PIN     16
+#define RELAY_TRIP_PIN     5
 
-// HX711 pins
-#define HX711_DOUT 16
-#define HX711_SCK  4
-// Calibration factor: raw ADC counts per kN. You MUST calibrate this with
-// a known weight -- see "Calibrating the HX711" in the README. Using the
-// wrong number here means your tension readings will be wrong (but the
-// system will still run -- it just won't be accurate until calibrated).
-const float TENSION_CALIBRATION = 21000.0;
+#define PWM_CHANNEL        0
+#define PWM_FREQ        5000
+#define PWM_RES            8
 
-// IR proximity sensor (digital pulse each time a belt marker passes)
-#define PROX_PIN 27
-const float MARKER_SPACING_M = 1.0; // distance between two consecutive markers on the belt
+// Wi-Fi Credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
 
-// ---------------- GLOBALS ----------------
-WiFiClient espClient;
-PubSubClient mqtt(espClient);
+WebServer server(80);
+
 Adafruit_MPU6050 mpu;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 HX711 scale;
 
-volatile unsigned long lastPulseMicros = 0;
-volatile float lastSpeedMps = 0;
+// Global Operational Variables
+volatile bool jointTriggered = false;
+volatile unsigned long lastInterruptTime = 0;
 
-void IRAM_ATTR onProxPulse() {
-  unsigned long now = micros();
-  unsigned long dt = now - lastPulseMicros;
-  if (dt > 1000) { // debounce -- ignore pulses closer than 1ms apart (electrical noise)
-    lastSpeedMps = MARKER_SPACING_M / (dt / 1e6);
-    lastPulseMicros = now;
+float currentSpeed = 3.0;
+float nominalSpeed = 3.0;
+int scanCount = 0;
+int systemTier = 0;
+String tearMode = "none";
+bool awaitingOperator = false;
+
+float telemetryVibration = 0.05;
+float telemetryTemp = 32.4;
+float telemetryTension = 450.0;
+int motorTorque = 140;
+
+// Hardware Interrupt for IR Joint Counter
+void IRAM_ATTR isrJointMarker() {
+  unsigned long now = millis();
+  if (now - lastInterruptTime > 300) { // Software debounce
+    jointTriggered = true;
+    lastInterruptTime = now;
   }
 }
 
-void connectWiFi() {
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(400);
-    Serial.print(".");
-  }
-  Serial.println(" connected: " + WiFi.localIP().toString());
+void setMotorSpeed(float mps) {
+  currentSpeed = mps;
+  int dutyCycle = map((int)(mps * 100), 0, 1000, 0, 255);
+  dutyCycle = constrain(dutyCycle, 0, 255);
+  ledcWrite(PWM_CHANNEL, dutyCycle);
+  motorTorque = (mps <= 0.01) ? 0 : constrain((int)(450 / max(mps * 0.35f, 0.2f)), 0, 480);
 }
 
-void connectMQTT() {
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  while (!mqtt.connected()) {
-    Serial.print("Connecting to MQTT broker...");
-    String clientId = "conveyor-" + String(JOINT_ID);
-    if (mqtt.connect(clientId.c_str())) {
-      Serial.println(" connected");
-    } else {
-      Serial.print(" failed, rc="); Serial.print(mqtt.state());
-      Serial.println(" -- retrying in 1.5s (check MQTT_HOST and that Docker is running)");
-      delay(1500);
+void triggerEmergencyHalt(const char* logReason) {
+  systemTier = 3;
+  setMotorSpeed(0.0);
+  digitalWrite(RELAY_TRIP_PIN, HIGH); // Trip circuit breaker relay
+  awaitingOperator = false;
+  Serial.printf("[BAYMAX EMERGENCY HALT]: %s\n", logReason);
+}
+
+// REST Endpoint: Deliver real-time telemetry to the dashboard
+void handleTelemetry() {
+  StaticJsonDocument<512> doc;
+  doc["speed"] = currentSpeed;
+  doc["vibration"] = telemetryVibration;
+  doc["temperature"] = telemetryTemp;
+  doc["tension"] = telemetryTension;
+  doc["torque"] = motorTorque;
+  doc["scanCount"] = scanCount;
+  doc["systemTier"] = systemTier;
+  doc["tearMode"] = tearMode;
+  doc["awaitingApproval"] = awaitingOperator;
+
+  String output;
+  serializeJson(doc, output);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", output);
+}
+
+// REST Endpoint: Receive commands from dashboard buttons
+void handleCommand() {
+  if (server.hasArg("action")) {
+    String action = server.arg("action");
+    if (action == "start_regular") {
+      tearMode = "regular";
+      scanCount = 0;
+      systemTier = 0;
+      awaitingOperator = false;
+      digitalWrite(RELAY_TRIP_PIN, LOW);
+      setMotorSpeed(nominalSpeed);
+    } else if (action == "start_false_alarm") {
+      tearMode = "false_alarm";
+      scanCount = 0;
+      systemTier = 0;
+      awaitingOperator = false;
+      digitalWrite(RELAY_TRIP_PIN, LOW);
+      setMotorSpeed(nominalSpeed);
+    } else if (action == "start_growing") {
+      tearMode = "growing";
+      scanCount = 0;
+      systemTier = 0;
+      awaitingOperator = false;
+      digitalWrite(RELAY_TRIP_PIN, LOW);
+      setMotorSpeed(nominalSpeed);
+    } else if (action == "confirm_tear") {
+      triggerEmergencyHalt("Operator confirmed tear on camera feed");
+    } else if (action == "dismiss_tear") {
+      tearMode = "none";
+      scanCount = 0;
+      systemTier = 0;
+      awaitingOperator = false;
+      setMotorSpeed(nominalSpeed);
+    } else if (action == "reset") {
+      tearMode = "none";
+      scanCount = 0;
+      systemTier = 0;
+      awaitingOperator = false;
+      digitalWrite(RELAY_TRIP_PIN, LOW);
+      setMotorSpeed(nominalSpeed);
     }
   }
-}
-
-float readVibrationRMS() {
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-  // Magnitude of the 3 acceleration axes, converted from m/s^2 to g
-  float mag = sqrt(a.acceleration.x * a.acceleration.x +
-                    a.acceleration.y * a.acceleration.y +
-                    a.acceleration.z * a.acceleration.z);
-  return mag / 9.80665;
+  if (server.hasArg("speed")) {
+    nominalSpeed = server.arg("speed").toFloat();
+    if (systemTier == 0 && !awaitingOperator) {
+      setMotorSpeed(nominalSpeed);
+    }
+  }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "text/plain", "OK");
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Wire.begin();
 
-  connectWiFi();
-  connectMQTT();
+  pinMode(RELAY_TRIP_PIN, OUTPUT);
+  digitalWrite(RELAY_TRIP_PIN, LOW);
 
-  if (!mpu.begin()) {
-    Serial.println("WARNING: MPU6050 not found -- check wiring (SDA=21, SCL=22)");
+  pinMode(IR_SENSOR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN), isrJointMarker, FALLING);
+
+  // Motor PWM Configuration
+  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RES);
+  ledcAttachPin(MOTOR_PWM_PIN, PWM_CHANNEL);
+  setMotorSpeed(nominalSpeed);
+
+  // Initialize I2C Bus on GPIO 21 & GPIO 22
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("Warning: MPU6050 not detected. Continuing...");
   } else {
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    Serial.println("MPU6050 ready");
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   }
 
-  scale.begin(HX711_DOUT, HX711_SCK);
-  scale.set_scale(TENSION_CALIBRATION);
-  scale.tare();  // zeroes the reading -- make sure nothing is pressing on the load cell when this runs
-  Serial.println("HX711 ready (tared to zero)");
+  if (!mlx.begin(0x5A, &Wire)) {
+    Serial.println("Warning: MLX90614 not detected. Continuing...");
+  }
 
-  pinMode(PROX_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PROX_PIN), onProxPulse, FALLING);
-  Serial.println("IR proximity sensor ready");
+  scale.begin(HX711_DT_PIN, HX711_SCK_PIN);
+  scale.set_scale(2280.0f); // Calibration factor
+  scale.tare();
 
-  Serial.println("Setup complete. Publishing readings every second...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf("\n[BAYMAX Node Online] IP: %s\n", WiFi.localIP().toString().c_str());
+
+  server.on("/telemetry", HTTP_GET, handleTelemetry);
+  server.on("/command", HTTP_GET, handleCommand);
+  server.begin();
 }
 
 void loop() {
-  if (!mqtt.connected()) connectMQTT();
-  mqtt.loop();
+  server.handleClient();
 
-  float vibration_g = readVibrationRMS();
-  float tension_kn  = scale.is_ready() ? scale.get_units(5) / 1000.0 : -1;
+  // Read Sensors
+  sensors_event_t a, g, temp;
+  if (mpu.getEvent(&a, &g, &temp)) {
+    telemetryVibration = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z)) / 9.81;
+  }
+  telemetryTemp = mlx.readObjectTempC();
+  if (scale.is_ready()) {
+    telemetryTension = scale.get_units(1);
+  }
 
-  // If no pulse in the last 3 seconds, belt is considered stopped (speed = 0)
-  float speed_mps = ((millis() / 1000.0) - (lastPulseMicros / 1000000.0) > 3.0) ? 0 : lastSpeedMps;
+  // Handle Multi-Scan Logic triggered by hardware IR sensor
+  if (jointTriggered) {
+    jointTriggered = false;
 
-  char payload[200];
-  snprintf(payload, sizeof(payload),
-    "{\"joint_id\":\"%s\",\"vibration_g\":%.3f,\"tension_kn\":%.2f,\"speed_mps\":%.2f}",
-    JOINT_ID, vibration_g, tension_kn, speed_mps);
+    if (tearMode == "false_alarm") {
+      scanCount++;
+      if (scanCount == 1) {
+        setMotorSpeed(0.80); // Decelerate on detection
+        awaitingOperator = true;
+        systemTier = 2;
+      }
+    } else if (tearMode == "regular") {
+      scanCount++;
+      if (scanCount == 1) {
+        setMotorSpeed(0.90); // Initial slowdown
+        systemTier = 1;
+      } else if (scanCount == 2) {
+        systemTier = 2;
+      } else if (scanCount >= 3) {
+        setMotorSpeed(0.20); // Minimum creep speed
+        awaitingOperator = true;
+        systemTier = 2;
+      }
+    } else if (tearMode == "growing") {
+      scanCount++;
+      if (scanCount == 1) {
+        setMotorSpeed(0.75);
+        systemTier = 1;
+      } else if (scanCount >= 2) {
+        triggerEmergencyHalt("Fast-trip rapid crack growth detected");
+      }
+    }
+  }
 
-  // ---- If you add an MLX90614 temperature sensor later, replace the
-  // block above with this one (and #include <Adafruit_MLX90614.h> +
-  // Adafruit_MLX90614 mlx; + mlx.begin() in setup()):
-  //
-  // float temperature_c = mlx.readObjectTempC();
-  // snprintf(payload, sizeof(payload),
-  //   "{\"joint_id\":\"%s\",\"vibration_g\":%.3f,\"tension_kn\":%.2f,"
-  //   "\"temperature_c\":%.1f,\"speed_mps\":%.2f}",
-  //   JOINT_ID, vibration_g, tension_kn, temperature_c, speed_mps);
-
-  String topic = String("conveyor/") + JOINT_ID + "/telemetry";
-  mqtt.publish(topic.c_str(), payload);
-
-  Serial.println(payload);
-  delay(SAMPLE_INTERVAL_MS);
+  delay(10);
 }
